@@ -1,6 +1,6 @@
 import os
-from market_db import MarketDB
-from market_logic import MarketDataCoordinator
+from Agent.agent_equity.market_db import MarketDB
+from Agent.agent_equity.market_logic import MarketDataCoordinator
 
 def main():
     # 1. Initialize the database
