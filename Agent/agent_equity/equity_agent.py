@@ -1,6 +1,7 @@
 import os
 import joblib
 import pandas as pd
+import numpy as np
 import datetime
 import urllib.parse
 from dotenv import load_dotenv
@@ -63,9 +64,10 @@ class EquityAgent:
 
             # 1. 初始化特征字典并注入动态数据
             input_dict = row.to_dict()
-            input_dict['Market_Median_2026'] = market_val
             input_dict['Internal_Salary_Rank'] = row.get('Internal_Salary_Rank', 0.5)
             input_dict['Performance_Consistency'] = row.get('Performance_Consistency', row['PerformanceRating'])
+            input_dict['Market_Median_2026'] = market_val / 12  # 从 18w 变回 1.5w
+            input_dict['current_salary'] = actual_salary / 12     # 如果模型里有用这个字段
 
             # 2. 构造 DataFrame 并强制排序 (使用你刚发给我的列表)
             trained_features = [
@@ -97,11 +99,19 @@ class EquityAgent:
                 final_input[col] = pd.to_numeric(final_input[col], errors='coerce').fillna(0).astype('int64')
 
             # --- STEP C: 执行内部公平性预测 (LightGBM Inference) ---
-            internal_valuation = self.model.predict(final_input)[0]
+            # 假设模型输出的是月薪 (MonthlyIncome)
+            pred_log = self.model.predict(final_input)[0]
+            
+            # 使用 np.expm1 还原成真实的【月薪】
+            internal_monthly_valuation = np.expm1(pred_log)
+            
+            # 转换为【年薪】，以便后续与 actual_salary 进行公平对比
+            internal_valuation_annual = internal_monthly_valuation * 12
+            print(f"DEBUG >>> Emp: {emp_id} | Actual: {actual_salary} | Raw Pred: {internal_valuation_annual}")
 
             # --- STEP D: 计算公平性缺口 (Gap Analysis) ---
             external_gap = (actual_salary - market_val) / market_val
-            internal_gap = (actual_salary - internal_valuation) / internal_valuation
+            internal_gap = (actual_salary - internal_valuation_annual) / internal_valuation_annual
 
             # --- STEP E: 结果持久化至 MongoDB (Blackboard Storage) ---
             analysis_result = {
@@ -111,7 +121,7 @@ class EquityAgent:
                 "actual_salary": round(actual_salary, 2),
                 "benchmarks": {
                     "market_2026_target": round(market_val, 2),
-                    "internal_fair_valuation": round(internal_valuation, 2)
+                    "internal_fair_valuation": round(internal_valuation_annual, 2)
                 },
                 "equity_gaps": {
                     "external_gap_pct": round(external_gap * 100, 2),
