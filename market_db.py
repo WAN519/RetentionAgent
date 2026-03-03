@@ -1,53 +1,74 @@
 import os
 import sys
-import datetime
-import traceback
+from dotenv import load_dotenv
 from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError
-from bson import ObjectId
+from pymongo.errors import PyMongoError
 
-MONGO_URI = os.environ.get("MONGODB_URI")
-DB_NAME = os.environ.get("MONGODB_NAME")
-COLLECTION_NAME = "market_benchmarks" # Dedicated collection for salary data
+load_dotenv("config.env")
+
 
 class MarketDB:
     def __init__(self):
+        # 1. read URI
+        self.uri = os.getenv("MONGODB_URI")
+        self.db_name = os.getenv("MONGODB_NAME")
+        self.collection_name = os.getenv("COLLECTION_NAME")
         self.client = None
         self.is_connected = False
-        try:
-            if not MONGO_URI:
-                raise ValueError("MONGODB_URI is not set in environment variables")
 
+        try:
+            # 2. check uri
+            if not self.uri:
+                print("❌ CONFIG ERROR: MONGODB_URI is missing in .env")
+                return
+
+            # 3. init mongodb client
             self.client = MongoClient(
-                MONGO_URI,
+                self.uri,
                 serverSelectionTimeoutMS=5000,
-                tlsAllowInvalidCertificates=True
+                tz_aware=True
             )
 
-            self.client.list_database_names()
+            # 4. check ping
+            self.client.admin.command('hello')
 
-            self.db = self.client[DB_NAME]
-            self.collection = self.db[COLLECTION_NAME]
+            self.db = self.client[self.db_name]
+            self.collection = self.db[self.collection_name]
             self.is_connected = True
-            print(f"✓ Connected to MongoDB: {DB_NAME}")
-        except Exception as e:
-            print(f"✗ Connection Failed: {e}")
+            print(f"MongoDB Initialized: {self.db_name}.{self.collection_name}")
 
-    def upsert_market_benchmark(self, market_doc):
-        """Updates or Inserts salary data based on role_name."""
+        except Exception as e:
+            print(f"Connection Failed: {e}")
+            self.is_connected = False
+
+    def upsert_benchmark(self, doc):
+        """Updates or inserts the market data."""
         if not self.is_connected: return False
         try:
-            query = {"role_name": market_doc["role_name"]}
-            self.collection.update_one(query, {"$set": market_doc}, upsert=True)
+            result = self.collection.update_one(
+                {"role_name": doc["role_name"]},
+                {"$set": doc},
+                upsert=True
+            )
+            if result.upserted_id:
+                print(f"Created new benchmark for: {doc['role_name']}")
+            else:
+                print(f"Updated existing benchmark for: {doc['role_name']}")
             return True
-        except Exception as e:
-            print(f"✗ Upsert failed: {e}")
+        except PyMongoError as e:
+            print(f"Upsert Failed: {e}")
             return False
 
-    def get_benchmark_by_role(self, role_name):
-        """Retrieves cached data for a specific role."""
+    def get_benchmark(self, role_name):
+        """Retrieves data for a role."""
         if not self.is_connected: return None
-        return self.collection.find_one({"role_name": role_name})
+        try:
+            return self.collection.find_one({"role_name": role_name})
+        except PyMongoError as e:
+            print(f"Query Failed: {e}")
+            return None
 
     def close(self):
-        if self.client: self.client.close()
+        if self.client:
+            self.client.close()
+            print("MongoDB connection closed.")
