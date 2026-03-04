@@ -12,3 +12,4 @@ if hasattr(model, 'feature_name_'):
 if hasattr(model, 'categorical_feature'):
     print("\n--- 🏷️ 类别特征索引 ---")
     print(model.categorical_feature)
+    print("test")
