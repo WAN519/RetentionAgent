@@ -2,6 +2,7 @@ import os
 import sys
 from dotenv import load_dotenv
 from pymongo import MongoClient
+import certifi
 from pymongo.errors import PyMongoError
 
 load_dotenv("config.env")
@@ -26,7 +27,8 @@ class MarketDB:
             self.client = MongoClient(
                 self.uri,
                 serverSelectionTimeoutMS=5000,
-                tz_aware=True
+                tz_aware=True,
+                tlsCAFile=certifi.where()
             )
 
             # 4. check ping
