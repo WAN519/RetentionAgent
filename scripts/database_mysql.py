@@ -26,7 +26,10 @@ import mysql.connector
 from mysql.connector import Error
 import os
 import tempfile
+from pathlib import Path
 from dotenv import load_dotenv
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class DatabaseManager:
@@ -49,14 +52,17 @@ class DatabaseManager:
         The SSL CA certificate is written to a temporary file because
         mysql-connector requires a file path rather than inline PEM content.
         """
-        load_dotenv('config.env')
+        load_dotenv(_PROJECT_ROOT / "config.env")
 
         ssl_ca_content = os.environ.get('DB_SSL_CA_CONTENT')
+        ssl_ca_path = None
         if ssl_ca_content:
             # Write inline certificate content to a temp file for the connector
-            temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
-            temp_file.write(ssl_ca_content)
+            temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False)
+            # Ensure PEM ends with a newline — required by OpenSSL's parser
+            temp_file.write(ssl_ca_content if ssl_ca_content.endswith('\n') else ssl_ca_content + '\n')
             temp_file.close()
+            ssl_ca_path = temp_file.name
 
         DB_CONFIG = {
             'host':             os.environ.get('DB_HOST'),
@@ -64,7 +70,7 @@ class DatabaseManager:
             'user':             os.environ.get('DB_USER'),
             'password':         os.environ.get('DB_PASSWORD'),
             'port':             int(os.environ.get('DB_PORT', 5432)),
-            'ssl_ca':           temp_file.name,
+            'ssl_ca':           ssl_ca_path,
             'ssl_verify_cert':  bool(os.environ.get('DB_SSL_VERIFY_CERT')) == True,
         }
 

@@ -13,12 +13,12 @@ Three-agent pipeline:
        What  : Scores each employee's salary against both the market benchmark
                (BLS CPI-adjusted) and an internal fair-valuation model.
 
-  2. Retention Agent (agents/retention/retention_agent_v1.py)
-       Input : Attrition.csv + MongoDB › Equity_Predictions
+  2. Salary Risk Agent (agents/retention/retention_agent_v1.py)
+       Input : ibm_enhanced_test.csv + MongoDB › Salary + MongoDB › Equity_Predictions
        Model : Cox Proportional Hazard survival model (models/cox_retention_v1.pkl)
-       Output: MongoDB › Retention_Predictions
-       What  : Predicts attrition risk score, buckets employees into Low/Mid/High,
-               and applies a deterministic rule override for triple-signal high risk.
+       Output: MongoDB › Risk
+       What  : Scores each employee's salary risk by combining Cox attrition hazard
+               scores with market pay gap analysis; writes JSON results to Risk collection.
 
   3. Emotion Agent (agents/emotion/emotion_agent.py + emotion_tool.py)
        Input : glassdoor_reviews.csv (not committed — ~280 MB)
@@ -63,15 +63,26 @@ def run_equity_agent():
     agent.run_analysis_pipeline(HR_TEST_CSV)
 
 
-def run_retention_agent():
+def run_retention_agent(ai_mode: bool = True):
     """
-    Run Agent 2: predict attrition risk using Cox survival model.
-    Reads from MongoDB › Equity_Predictions; writes to Retention_Predictions.
+    Run Agent 2: salary risk scoring using Cox survival model + market pay gap analysis.
+    Reads from ibm_enhanced_test.csv + MongoDB › Salary + Equity_Predictions.
+    Writes enriched JSON results to MongoDB › Risk.
+
+    Args:
+        ai_mode: If True (default), use AISalaryRiskAgent — scores via Cox model
+                 then enriches results through the Claude API before saving.
+                 If False, use SalaryRiskAgent directly (no Claude call).
     """
-    from agents.retention.retention_agent_v1 import RetentionAgentV1
-    print("\n=== Step 2: Retention Agent ===")
-    agent = RetentionAgentV1(RETENTION_MODEL, RETENTION_FEATURES)
-    agent.run(HR_CSV)
+    if ai_mode:
+        from agents.retention.ai_salary_risk_agent import AISalaryRiskAgent
+        print("\n=== Step 2: AI Salary Risk Agent (Claude-enriched) ===")
+        agent = AISalaryRiskAgent(RETENTION_MODEL, RETENTION_FEATURES)
+        agent.run(HR_TEST_CSV)
+    else:
+        from agents.retention.retention_agent_v1 import SalaryRiskAgent, run_salary_risk_agent
+        print("\n=== Step 2: Salary Risk Agent (scoring only) ===")
+        run_salary_risk_agent()
 
 
 def run_emotion_agent(company_name: str, data_path: str):
