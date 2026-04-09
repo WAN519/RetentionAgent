@@ -168,6 +168,60 @@ class GlassdoorEmotionAgent:
         print(f"Pipeline complete. Results saved to {self.db.name}.{self.collection.name}")
 
 
+def run_emotion_analysis(company_name: str, csv_path: str, month: str | None = None) -> dict:
+    """
+    Top-level tool entry point: run the full NLP pipeline for one company and
+    persist the enriched reviews to MongoDB.
+
+    This function is designed to be called as a Claude tool. It loads the CSV,
+    filters by company, runs GlassdoorEmotionAgent, and returns a summary dict
+    that Claude can use to decide whether to proceed with downstream queries.
+
+    Args:
+        company_name (str): Company name matching the 'firm' column in the CSV.
+        csv_path (str): Absolute or relative path to the Glassdoor reviews CSV.
+        month (str | None): Analysis month in YYYY-MM format. Defaults to current month.
+
+    Returns:
+        dict: Status summary with review count, or an error key on failure.
+    """
+    import os
+    from datetime import datetime
+    from dotenv import load_dotenv
+
+    load_dotenv("config.env")
+
+    if month is None:
+        month = datetime.now().strftime("%Y-%m")
+
+    try:
+        raw_df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        return {"error": f"CSV not found: {csv_path}"}
+    except Exception as e:
+        return {"error": f"Failed to read CSV: {e}"}
+
+    company_df = raw_df[raw_df["firm"] == company_name].copy()
+    if company_df.empty:
+        return {"error": f"No reviews found for '{company_name}' in {csv_path}"}
+
+    company_df["analysis_month"] = month
+
+    mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+    db_name   = os.getenv("MONGODB_NAME", "MarketInformation")
+
+    agent = GlassdoorEmotionAgent(mongo_uri=mongo_uri, db_name=db_name)
+    agent.run_pipeline(company_df)
+
+    return {
+        "status":            "analysis_complete",
+        "company":           company_name,
+        "month":             month,
+        "reviews_processed": len(company_df),
+        "next_step":         "Call get_emotion_summary and get_high_risk_reviews to query the results.",
+    }
+
+
 if __name__ == "__main__":
     raw_df = pd.read_csv("data/glassdoor_reviews.csv")
 
