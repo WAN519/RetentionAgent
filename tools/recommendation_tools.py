@@ -2,10 +2,10 @@
 tools/recommendation_tools.py
 
 Tool implementations, JSON schemas, and dispatcher for the retention
-recommendation agent (agents/retention/claude_recommendation_agent.py).
+recommendation agent (agents/retention/recommendation_agent.py).
 
 Tools:
-  get_employee_profiles   — join Emotion + employee_comment by employee_id/month
+  get_employee_profiles   — join Retention_Predictions + Emotion + employee_comment
   save_recommendations    — persist Claude's recommendations to MongoDB
 """
 
@@ -33,62 +33,95 @@ def _get_db():
 
 def get_employee_profiles(month: str, risk_buckets: list[str] | None = None) -> dict:
     """
-    Join Emotion and employee_comment collections by employee_id for a given month.
+    Join three collections to build employee profiles for recommendation generation.
 
-    Filters by risk_buckets (default: High and Mid only — Low-risk employees
-    rarely need proactive retention action).
+    Sources:
+      - Risk             (employee-level scores from ai_salary_risk_agent — field-mapped)
+      - Emotion          (company-level sentiment report, by month)
+      - employee_comment (latest comment per employee_id)
+
+    Field mapping from Risk → canonical profile schema:
+      combined_risk_bucket → risk_bucket
+      cox_risk_score       → risk_score
+      cox_risk_pct         → risk_pct
+      risk_factors         → risk_reasons
 
     Args:
         month:        Analysis month in YYYY-MM format.
         risk_buckets: Risk tiers to include. Defaults to ["High", "Mid"].
 
     Returns:
-        dict with a list of combined employee profiles.
+        dict with company_sentiment_report and a list of combined employee profiles.
     """
     if risk_buckets is None:
         risk_buckets = ["High", "Mid"]
 
     db = _get_db()
 
-    # Fetch emotion/risk records for the requested month and risk tiers
-    emotion_docs = list(db["Emotion"].find(
-        {"month": month, "risk_bucket": {"$in": risk_buckets}},
-        {"_id": 0, "employee_id": 1, "month": 1,
-         "risk_score": 1, "risk_pct": 1, "risk_bucket": 1,
-         "months_since_promotion": 1, "risk_reasons": 1}
+    # 1. Employee-level risk data from Risk collection (written by ai_salary_risk_agent)
+    #    Filter by month using scoring_date date range
+    from datetime import datetime as _dt
+    year, mon = map(int, month.split("-"))
+    month_start = _dt(year, mon, 1)
+    month_end   = _dt(year + (1 if mon == 12 else 0), 1 if mon == 12 else mon + 1, 1)
+
+    risk_docs = list(db[os.getenv("COLLECTION_NAME_RISK", "Risk")].find(
+        {
+            "scoring_date":         {"$gte": month_start, "$lt": month_end},
+            "combined_risk_bucket": {"$in": risk_buckets},
+        },
+        {"_id": 0,
+         "employee_id": 1, "scoring_date": 1,
+         "combined_risk_bucket": 1, "cox_risk_score": 1, "cox_risk_pct": 1,
+         "risk_factors": 1, "claude_analysis": 1,
+         "salary_gap_pct": 1, "salary_risk_tier": 1},
+        sort=[("cox_risk_pct", -1)],
+        limit=199,
     ))
 
-    if not emotion_docs:
-        return {"error": f"No Emotion records found for month={month}, buckets={risk_buckets}"}
+    if not risk_docs:
+        return {"error": f"No Risk records found for month={month}, buckets={risk_buckets}"}
 
-    # Build employee_id → comment lookup from employee_comment
-    # Match month by extracting YYYY-MM prefix from created_at
-    emp_ids = [d["employee_id"] for d in emotion_docs]
+    # 2. Company-level sentiment report from Emotion (one doc per month)
+    emotion_doc = db["Emotion"].find_one({"month": month}, {"_id": 0, "company_sentiment_report": 1})
+    company_sentiment_report = emotion_doc.get("company_sentiment_report") if emotion_doc else None
+
+    # 3. Latest comment per employee from employee_comment
+    emp_ids = [d["employee_id"] for d in risk_docs]
     comment_docs = list(db["employee_comment"].find(
         {"employee_id": {"$in": emp_ids}},
         {"_id": 0, "employee_id": 1, "comment": 1, "created_at": 1}
     ))
 
-    # Keep the latest comment per employee if multiple exist
     comment_map: dict = {}
     for c in comment_docs:
         eid = c["employee_id"]
         if eid not in comment_map or c.get("created_at", "") > comment_map[eid].get("created_at", ""):
             comment_map[eid] = c
 
-    # Merge
+    # 4. Merge — normalise Risk field names to canonical profile schema
     profiles = []
-    for doc in emotion_docs:
+    for doc in risk_docs:
         eid = doc["employee_id"]
-        profile = {**doc}
-        comment_entry = comment_map.get(eid)
-        profile["comment"] = comment_entry["comment"] if comment_entry else None
-        profiles.append(profile)
+        ai  = doc.get("claude_analysis") or {}
+        profiles.append({
+            "employee_id":           eid,
+            "month":                 month,
+            "risk_score":            doc.get("cox_risk_score"),
+            "risk_pct":              doc.get("cox_risk_pct"),
+            "risk_bucket":           doc.get("combined_risk_bucket"),
+            "salary_gap_pct":        doc.get("salary_gap_pct"),
+            "salary_risk_tier":      doc.get("salary_risk_tier"),
+            "risk_reasons":          doc.get("risk_factors", []),
+            "risk_summary":          ai.get("risk_summary"),
+            "comment":               comment_map.get(eid, {}).get("comment"),
+        })
 
     return {
-        "month":    month,
-        "count":    len(profiles),
-        "profiles": profiles,
+        "month":                    month,
+        "count":                    len(profiles),
+        "company_sentiment_report": company_sentiment_report,
+        "profiles":                 profiles,
     }
 
 
@@ -231,10 +264,12 @@ TOOLS = [
     {
         "name": "get_employee_profiles",
         "description": (
-            "Fetch combined employee profiles for a given month by joining the Emotion "
-            "collection (risk scores, risk reasons, sentiment data) with the employee_comment "
-            "collection (individual employee comments). Only returns High and Mid risk employees "
-            "by default. Call this first to get the data before generating recommendations."
+            "Fetch combined employee profiles for a given month by joining three collections: "
+            "Risk (employee-level Cox risk scores, salary gap, and Claude HR analysis), "
+            "Emotion (company-level Glassdoor sentiment report for the month), and "
+            "employee_comment (each employee's own words). "
+            "Only returns High and Mid risk employees by default. "
+            "Call this first before generating recommendations."
         ),
         "input_schema": {
             "type": "object",

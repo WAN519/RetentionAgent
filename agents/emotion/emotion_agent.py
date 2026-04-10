@@ -1,7 +1,7 @@
 """
-agents/emotion/claude_attrition_agent.py
+agents/emotion/emotion_agent.py
 
-Claude Opus-powered Glassdoor sentiment analysis agent.
+Claude-powered Glassdoor sentiment analysis agent.
 
 Workflow:
   1. Claude calls run_emotion_analysis → NLP pipeline labels every Glassdoor
@@ -9,15 +9,19 @@ Workflow:
   2. Claude calls get_emotion_summary → aggregated topic-level statistics.
   3. Claude calls get_high_risk_reviews → concrete review excerpts with the
      highest negative scores for qualitative grounding.
-  4. Claude synthesizes the sentiment data into an attrition risk report:
-     root causes derived from employee voice, and targeted HR interventions.
+  4. Claude synthesizes the data into a company-level sentiment report and
+     saves it to the Emotion collection.
+
+Output (MongoDB Emotion collection):
+  One document per company per month:
+    { company, month, company_sentiment_report, created_at }
 
 All tool implementations live in tools/attrition_tools.py.
 
 Usage:
-  python -m agents.emotion.claude_attrition_agent \\
+  python -m agents.emotion.emotion_agent \\
       --company Apple \\
-      --csv glassdoor_reviews.csv \\
+      --csv data/mock_reviews.csv \\
       --month 2026-04
 """
 
@@ -34,11 +38,9 @@ from pymongo import MongoClient
 
 from tools.attrition_tools import TOOLS, execute_tool
 
-# Resolve config.env relative to the project root regardless of the working directory
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_PROJECT_ROOT / "config.env")
 
-# Only expose the three emotion-related tools to this agent
 EMOTION_TOOLS = [t for t in TOOLS if t["name"] in {
     "run_emotion_analysis",
     "get_emotion_summary",
@@ -93,13 +95,13 @@ by a number or a direct quote from the data you retrieved."""
 # Agent loop
 # ---------------------------------------------------------------------------
 
-def run_attrition_agent(
+def run_emotion_agent(
     company_name: str,
     csv_path: str,
     month: str | None = None,
 ) -> str:
     """
-    Run the sentiment-driven attrition analysis agent.
+    Run the Glassdoor sentiment analysis agent and save the report to MongoDB.
 
     Args:
         company_name: Company to analyze. Must match the 'firm' field in the CSV.
@@ -107,10 +109,10 @@ def run_attrition_agent(
         month:        Analysis month in YYYY-MM format. Defaults to current month.
 
     Returns:
-        The final structured HR report as a string.
+        The final structured sentiment report as a string.
     """
     if month is None:
-        month = datetime.now().strftime("%Y-%m")
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
 
     api_key = os.getenv("CLAUDE_API_KEY")
     if not api_key:
@@ -118,8 +120,7 @@ def run_attrition_agent(
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    # Build a modified tool schema: strip csv_path from run_emotion_analysis.
-    # Claude only needs to pass company_name + month; csv_path is injected by Python.
+    # Strip csv_path from the tool schema — injected by Python, not passed by Claude
     emotion_tools = copy.deepcopy(EMOTION_TOOLS)
     for t in emotion_tools:
         if t["name"] == "run_emotion_analysis":
@@ -128,26 +129,23 @@ def run_attrition_agent(
                 r for r in t["input_schema"].get("required", []) if r != "csv_path"
             ]
 
-    # Wrapper that injects csv_path before dispatching to execute_tool
     def _execute(name: str, inputs: dict) -> str:
         if name == "run_emotion_analysis":
             inputs = {**inputs, "csv_path": csv_path}
         return execute_tool(name, inputs)
 
-    user_message = (
-        f"Please analyze employee sentiment and predict attrition risk for "
+    messages = [{"role": "user", "content": (
+        f"Please analyze employee sentiment and attrition risk for "
         f"**{company_name}**, period **{month}**.\n\n"
         f"Run the NLP pipeline first, then retrieve the aggregated sentiment "
         f"statistics, then sample the most negative reviews. "
         f"Identify the primary attrition drivers from the employee voice data "
         f"and provide specific HR interventions for each driver."
-    )
-
-    messages = [{"role": "user", "content": user_message}]
+    )}]
     final_report = ""
 
     print(f"\n{'='*62}")
-    print(f"  RetentionAgent  |  Sentiment Attrition Analysis")
+    print(f"  Emotion Agent  |  Sentiment Analysis")
     print(f"  Company : {company_name}")
     print(f"  Period  : {month}")
     print(f"  CSV     : {csv_path}")
@@ -201,58 +199,34 @@ def run_attrition_agent(
 
 def _save_report(report: str, company_name: str, month: str) -> None:
     """
-    Save one JSON document per employee to the Emotion collection.
-    Each document contains the employee's individual risk data from
-    Retention_Predictions plus the company-level sentiment report as context.
+    Save the company-level sentiment report to the Emotion collection.
+    One document per company per month — upserts on re-run.
     """
     uri             = os.getenv("MONGODB_URI")
     db_name         = os.getenv("MONGODB_NAME", "MarketInformation")
     collection_name = os.getenv("COLLECTION_NAME_EMOTION", "Emotion")
 
     client = MongoClient(uri, serverSelectionTimeoutMS=5000, tlsCAFile=certifi.where())
-    db = client[db_name]
+    db     = client[db_name]
 
     if collection_name not in db.list_collection_names():
         db.create_collection(collection_name)
         print(f"[MongoDB] Created collection '{collection_name}'")
 
-    # Fetch all employees from Retention_Predictions (emotion-related fields only)
-    employees = list(db["Retention_Predictions"].find(
-        {},
-        {"_id": 0, "employee_id": 1, "risk_score": 1, "risk_pct": 1,
-         "risk_bucket": 1, "months_since_promotion": 1, "risk_reasons": 1}
-    ))
+    doc = {
+        "company":                  company_name,
+        "month":                    month,
+        "company_sentiment_report": report,
+        "created_at":               datetime.now(timezone.utc).isoformat(),
+    }
 
-    if not employees:
-        print("[MongoDB] No employees found in Retention_Predictions — saving company-level report only.")
-        db[collection_name].insert_one({
-            "company":    company_name,
-            "month":      month,
-            "report":     report,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        client.close()
-        return
-
-    now = datetime.now(timezone.utc).isoformat()
-    docs = [
-        {
-            "employee_id":              emp["employee_id"],
-            "company":                  company_name,
-            "month":                    month,
-            "risk_score":               emp.get("risk_score"),
-            "risk_pct":                 emp.get("risk_pct"),
-            "risk_bucket":              emp.get("risk_bucket"),
-            "months_since_promotion":   emp.get("months_since_promotion"),
-            "risk_reasons":             emp.get("risk_reasons"),
-            "company_sentiment_report": report,
-            "created_at":               now,
-        }
-        for emp in employees
-    ]
-
-    result = db[collection_name].insert_many(docs)
-    print(f"[MongoDB] Saved {len(result.inserted_ids)} employee reports → collection='{collection_name}'")
+    db[collection_name].update_one(
+        {"company": company_name, "month": month},
+        {"$set": doc},
+        upsert=True,
+    )
+    print(f"[MongoDB] Emotion report saved → collection='{collection_name}' "
+          f"company='{company_name}' month='{month}'")
     client.close()
 
 
@@ -262,17 +236,17 @@ def _save_report(report: str, company_name: str, month: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Claude-powered Glassdoor sentiment attrition analyzer"
+        description="Claude-powered Glassdoor sentiment analysis agent"
     )
     parser.add_argument("--company", default="Apple",
-                        help="Company name to analyze (must match 'firm' column in CSV)")
-    parser.add_argument("--csv",     default="glassdoor_reviews.csv",
+                        help="Company name (must match 'firm' column in CSV)")
+    parser.add_argument("--csv",     default="data/mock_reviews.csv",
                         help="Path to the Glassdoor reviews CSV file")
     parser.add_argument("--month",   default=None,
                         help="Analysis month in YYYY-MM format (default: current month)")
     args = parser.parse_args()
 
-    report = run_attrition_agent(
+    run_emotion_agent(
         company_name=args.company,
         csv_path=args.csv,
         month=args.month,
