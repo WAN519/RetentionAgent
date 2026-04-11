@@ -38,7 +38,11 @@ load_dotenv(_PROJECT_ROOT / "config.env")
 app = FastAPI(title="RetentionAgent API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://wan519.github.io",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
