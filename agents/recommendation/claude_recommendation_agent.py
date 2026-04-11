@@ -1,5 +1,5 @@
 """
-agents/retention/claude_recommendation_agent.py
+agents/recommendation/claude_recommendation_agent.py
 
 Claude-powered retention recommendation agent with adversarial audit gate.
 
@@ -14,7 +14,7 @@ Workflow:
   5. On second attempt the result is always saved regardless of verdict.
 
 Usage:
-  python -m agents.retention.claude_recommendation_agent --month 2026-04
+  python -m agents.recommendation.claude_recommendation_agent --month 2026-04
 """
 
 import os
