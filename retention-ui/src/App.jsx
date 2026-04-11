@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 
-const API_BASE = "";   // proxied by Vite → http://localhost:8000
+const API_BASE = import.meta.env.VITE_API_BASE ?? "";  // prod: Render URL, dev: Vite proxy
 
 const riskColor = (v) => v >= 80 ? "#FF3B30" : v >= 65 ? "#FF9500" : "#34C759";
 const riskLabel = (v) => v >= 80 ? "Critical" : v >= 65 ? "High" : "Moderate";
