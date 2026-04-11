@@ -1,26 +1,15 @@
 """
-agents/audit/audit_agent.py
+agents/risk_audit/risk_audit_agent.py
 
-Audit Agent — adversarial quality gate before HR / manager distribution.
+Risk Audit Agent — adversarial quality gate for the retention risk scoring pipeline.
 
-Acts as a skeptical critic that reviews every AI-generated risk report
-produced by AISalaryRiskAgent and flags issues before the report reaches
-HR or managers.
+Audits AI-generated employee risk reports (Risk collection) before they reach
+HR teams or managers, and rejects or flags anything unreliable or inconsistent.
 
 Pipeline:
-  Tool  →  fetch_latest_run() / fetch_run_by_id()   pull Risk docs from MongoDB
-  API   →  Claude claude-opus-4-6 (critic persona)   structured audit review
+  Tool  →  fetch latest Risk run from MongoDB
+  API   →  Claude claude-opus-4-6 (critic persona) — structured audit review
   Store →  save audit result to MongoDB: Audit_Reports
-
-Checks performed per employee record:
-  1. Schema completeness    — required fields present and non-empty
-  2. Risk level consistency — risk_level aligns with cox_risk_bucket + salary_risk_tier
-  3. Priority calibration   — High risk → priority_score ≥ 7; Low risk → ≤ 4
-  4. Urgency alignment      — "Immediate" urgency must correspond to High risk
-  5. Recommendation quality — flags generic/boilerplate advice
-  6. Salary gap plausibility— salary_gap_pct > 80 % is suspicious
-  7. Root cause coverage    — High-risk employees must have ≥ 2 root causes
-  8. Priority inflation     — warns if > 40 % of employees are priority ≥ 8
 
 Audit verdicts:
   APPROVED      — report is ready for HR / manager distribution
@@ -29,26 +18,19 @@ Audit verdicts:
 
 MongoDB output schema (Audit_Reports):
     {
-        audit_id,            # UUID4
-        run_id,              # run_id of the audited batch
-        audit_date,          # UTC timestamp
-        verdict,             # APPROVED | NEEDS_REVIEW | REJECTED
-        audit_summary: {
-            total_reviewed, approved_count, flagged_count, critical_count,
-            overall_assessment
-        },
-        quality_metrics: {
-            risk_calibration_score,      # 0–10
-            recommendation_quality_score,# 0–10
-            urgency_alignment_score,     # 0–10
-            data_completeness_score,     # 0–10
-            overall_quality_score        # weighted average
-        },
-        flagged_employees: [
-            { employee_id, issues: [...], severity, suggested_correction }
-        ],
-        audit_notes          # critic's overall narrative
+        audit_id, run_id, audit_date, verdict,
+        audit_summary: { total_reviewed, approved_count, flagged_count,
+                         critical_count, overall_assessment },
+        quality_metrics: { risk_calibration_score, recommendation_quality_score,
+                           urgency_alignment_score, data_completeness_score,
+                           overall_quality_score },
+        flagged_employees: [{ employee_id, issues, severity, suggested_correction }],
+        audit_notes
     }
+
+Usage:
+  python -m agents.risk_audit.risk_audit_agent
+  python -m agents.risk_audit.risk_audit_agent --run-id <uuid>
 """
 
 import os
@@ -200,14 +182,11 @@ def _fetch_run_docs(run_id: str | None) -> tuple[list[dict], str]:
     """
     Fetch all Risk documents for a given run_id.
     If run_id is None, fetches the most recent run.
-
-    Returns (docs, resolved_run_id).
     """
     db   = _get_mongo_db()
-    coll = db["Risk"]
+    coll = db[os.getenv("COLLECTION_NAME_RISK", "Risk")]
 
     if run_id is None:
-        # Find the most recent run_id by analysis_date
         latest = coll.find_one(
             {"run_id": {"$exists": True}},
             sort=[("analysis_date", DESCENDING)],
@@ -233,13 +212,11 @@ _GENERIC_PHRASES = [
     "look into", "may want to", "could consider",
 ]
 
+
 def _preflight_checks(docs: list[dict]) -> dict:
-    """
-    Run deterministic rule checks before sending to Claude.
-    Returns a summary dict that is injected into the Claude prompt.
-    """
-    issues      = []   # list of {employee_id, issue, severity}
-    high_pri    = 0    # employees with priority_score >= 8
+    """Deterministic rule checks injected into the Claude audit prompt."""
+    issues   = []
+    high_pri = 0
 
     for doc in docs:
         eid      = doc.get("employee_id", "UNKNOWN")
@@ -252,13 +229,11 @@ def _preflight_checks(docs: list[dict]) -> dict:
         causes   = analysis.get("root_causes") or []
         recs     = analysis.get("recommendations") or []
 
-        # 1. Data completeness
         for field in ("employee_id", "risk_level", "claude_analysis", "analysis_date"):
             if not doc.get(field):
                 issues.append({"employee_id": eid, "severity": "Critical",
                                "issue": f"Missing required field: {field}"})
 
-        # 2. Risk level vs Cox / salary tier consistency
         if rl == "High" and cox_bkt == "Low" and sal_tier == "Low":
             issues.append({"employee_id": eid, "severity": "Critical",
                            "issue": "risk_level=High contradicts both cox_risk_bucket=Low and salary_risk_tier=Low"})
@@ -266,7 +241,6 @@ def _preflight_checks(docs: list[dict]) -> dict:
             issues.append({"employee_id": eid, "severity": "Critical",
                            "issue": "risk_level=Low contradicts cox_risk_bucket=High"})
 
-        # 3. Priority score calibration
         if prio is not None:
             if rl == "High" and prio < 7:
                 issues.append({"employee_id": eid, "severity": "Critical",
@@ -277,7 +251,6 @@ def _preflight_checks(docs: list[dict]) -> dict:
             if prio >= 8:
                 high_pri += 1
 
-        # 4. Urgency alignment
         if urgency == "Immediate" and rl != "High":
             issues.append({"employee_id": eid, "severity": "Warning",
                            "issue": f"urgency=Immediate but risk_level={rl}"})
@@ -285,7 +258,6 @@ def _preflight_checks(docs: list[dict]) -> dict:
             issues.append({"employee_id": eid, "severity": "Warning",
                            "issue": "urgency=Monitor on a High risk employee"})
 
-        # 5. Salary gap plausibility
         gap_pct = abs(doc.get("salary_gap_pct") or 0)
         if gap_pct > 150:
             issues.append({"employee_id": eid, "severity": "Critical",
@@ -294,7 +266,6 @@ def _preflight_checks(docs: list[dict]) -> dict:
             issues.append({"employee_id": eid, "severity": "Warning",
                            "issue": f"salary_gap_pct={gap_pct:.1f}% is unusually large (> 80%)"})
 
-        # 6. Root cause coverage
         if not causes:
             issues.append({"employee_id": eid, "severity": "Critical",
                            "issue": "root_causes is empty"})
@@ -302,7 +273,6 @@ def _preflight_checks(docs: list[dict]) -> dict:
             issues.append({"employee_id": eid, "severity": "Warning",
                            "issue": f"High risk employee has only {len(causes)} root cause(s)"})
 
-        # 7. Recommendation quality (generic phrase detection)
         generic_count = sum(
             1 for r in recs
             if any(phrase in r.lower() for phrase in _GENERIC_PHRASES)
@@ -311,31 +281,26 @@ def _preflight_checks(docs: list[dict]) -> dict:
             issues.append({"employee_id": eid, "severity": "Warning",
                            "issue": f"{generic_count}/{len(recs)} recommendations use generic language"})
 
-    # 8. Priority inflation (batch-level)
     inflation_rate = high_pri / len(docs) if docs else 0
     if inflation_rate > 0.40:
-        issues.append({"employee_id": "BATCH",  "severity": "Warning",
+        issues.append({"employee_id": "BATCH", "severity": "Warning",
                        "issue": f"Priority inflation: {high_pri}/{len(docs)} ({inflation_rate:.0%}) employees have priority_score ≥ 8"})
 
     return {
-        "total_records":   len(docs),
+        "total_records":    len(docs),
         "preflight_issues": issues,
-        "critical_count":  sum(1 for i in issues if i["severity"] == "Critical"),
-        "warning_count":   sum(1 for i in issues if i["severity"] == "Warning"),
+        "critical_count":   sum(1 for i in issues if i["severity"] == "Critical"),
+        "warning_count":    sum(1 for i in issues if i["severity"] == "Warning"),
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main audit agent
+# Risk Audit Agent
 # ──────────────────────────────────────────────────────────────────────────────
-class AuditAgent:
+class RiskAuditAgent:
     """
-    Adversarial critic that reviews AISalaryRiskAgent output before
-    distribution to HR or managers.
-
-    Attributes:
-        client (anthropic.Anthropic): Anthropic API client.
-        model (str): Claude model ID.
+    Adversarial critic that reviews RetentionAgent output (Risk collection)
+    before distribution to HR or managers.
     """
 
     MODEL = "claude-opus-4-6"
@@ -346,43 +311,34 @@ class AuditAgent:
             raise EnvironmentError("CLAUDE_API_KEY (or ANTHROPIC_API_KEY) not set in config.env")
         self.client = anthropic.Anthropic(api_key=api_key)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Step 1 — Claude critique
-    # ──────────────────────────────────────────────────────────────────────────
     def _run_claude_audit(self, docs: list[dict], preflight: dict) -> dict:
-        """
-        Send records + preflight findings to Claude for deep qualitative audit.
-        Uses structured JSON output constrained by _AUDIT_SCHEMA.
-        """
-        # Limit payload: send full detail for flagged employees, summary for others
-        flagged_ids = {i["employee_id"] for i in preflight["preflight_issues"]}
+        flagged_ids  = {i["employee_id"] for i in preflight["preflight_issues"]}
         payload_docs = []
         for doc in docs:
             eid = doc.get("employee_id", "")
             if eid in flagged_ids or doc.get("risk_level") == "High":
-                payload_docs.append(doc)   # full record
+                payload_docs.append(doc)
             else:
-                # Abbreviated summary for non-flagged low/mid risk employees
                 payload_docs.append({
-                    "employee_id":    eid,
-                    "risk_level":     doc.get("risk_level"),
-                    "cox_risk_bucket":doc.get("cox_risk_bucket"),
-                    "salary_risk_tier":doc.get("salary_risk_tier"),
-                    "urgency":        (doc.get("claude_analysis") or {}).get("urgency"),
-                    "priority_score": (doc.get("claude_analysis") or {}).get("priority_score"),
-                    "root_causes_count": len((doc.get("claude_analysis") or {}).get("root_causes") or []),
+                    "employee_id":           eid,
+                    "risk_level":            doc.get("risk_level"),
+                    "cox_risk_bucket":       doc.get("cox_risk_bucket"),
+                    "salary_risk_tier":      doc.get("salary_risk_tier"),
+                    "urgency":               (doc.get("claude_analysis") or {}).get("urgency"),
+                    "priority_score":        (doc.get("claude_analysis") or {}).get("priority_score"),
+                    "root_causes_count":     len((doc.get("claude_analysis") or {}).get("root_causes") or []),
                     "recommendations_count": len((doc.get("claude_analysis") or {}).get("recommendations") or []),
                 })
 
         user_content = (
             "## Pre-flight Rule Check Results\n"
             f"{json.dumps(preflight, indent=2, default=str)}\n\n"
-            "## Employee Risk Records (full detail for flagged/High-risk; summary for others)\n"
+            "## Employee Risk Records\n"
             f"{json.dumps(payload_docs, indent=2, default=str)}\n\n"
             "Perform your audit. Be specific, name employee IDs, and give your verdict."
         )
 
-        print(f"[Claude API] Sending audit request ({len(payload_docs)} records) to {self.MODEL}...")
+        print(f"[RiskAuditAgent] Sending {len(payload_docs)} records to Claude...")
 
         with self.client.messages.stream(
             model=self.MODEL,
@@ -394,94 +350,60 @@ class AuditAgent:
         ) as stream:
             final = stream.get_final_message()
 
-        thinking_chars = sum(
-            len(getattr(b, "thinking", "") or "")
-            for b in final.content if b.type == "thinking"
-        )
-        print(f"[Claude API] Done. Thinking chars: {thinking_chars} | "
-              f"Input: {final.usage.input_tokens} | Output: {final.usage.output_tokens}")
-
         text_block = next(b for b in final.content if b.type == "text")
         return json.loads(text_block.text)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Step 2 — save audit report to MongoDB
-    # ──────────────────────────────────────────────────────────────────────────
     def _save_audit(self, run_id: str, audit_result: dict) -> str:
-        """Insert the audit report into MongoDB Audit_Reports collection."""
         audit_id   = str(uuid.uuid4())
         audit_date = datetime.datetime.now(datetime.timezone.utc)
 
-        doc = {
-            "audit_id":   audit_id,
-            "run_id":     run_id,
-            "audit_date": audit_date,
-            **audit_result,
-        }
+        doc = {"audit_id": audit_id, "run_id": run_id, "audit_date": audit_date, **audit_result}
 
         db = _get_mongo_db()
         db["Audit_Reports"].insert_one(doc)
         print(f"[MongoDB] Audit report saved → Audit_Reports (audit_id={audit_id})")
         return audit_id
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public entry point
-    # ──────────────────────────────────────────────────────────────────────────
     def run(self, run_id: str | None = None) -> dict:
         """
-        Audit the latest (or specified) AISalaryRiskAgent run.
+        Audit the latest (or specified) RetentionAgent run.
 
         Args:
             run_id: Specific run_id to audit. If None, audits the most recent run.
-
-        Returns:
-            Full audit result dict including verdict and flagged employees.
         """
-        # Fetch records
         docs, resolved_run_id = _fetch_run_docs(run_id)
 
-        # Pre-flight deterministic checks
-        print(f"[Audit] Running pre-flight checks on {len(docs)} records...")
+        print(f"[RiskAuditAgent] Running pre-flight checks on {len(docs)} records...")
         preflight = _preflight_checks(docs)
-        print(f"[Audit] Pre-flight: {preflight['critical_count']} critical | "
+        print(f"[RiskAuditAgent] Pre-flight: {preflight['critical_count']} critical | "
               f"{preflight['warning_count']} warnings")
 
-        # Claude deep audit
         audit_result = self._run_claude_audit(docs, preflight)
-
-        # Merge pre-flight critical/warning counts into audit_summary
         audit_result["audit_summary"]["preflight_critical"] = preflight["critical_count"]
         audit_result["audit_summary"]["preflight_warnings"]  = preflight["warning_count"]
 
-        # Save to MongoDB
         audit_id = self._save_audit(resolved_run_id, audit_result)
-
-        # Console report
         self._print_report(audit_result, resolved_run_id, audit_id)
         return audit_result
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Console output
-    # ──────────────────────────────────────────────────────────────────────────
     @staticmethod
     def _print_report(result: dict, run_id: str, audit_id: str):
         verdict = result["verdict"]
         summary = result["audit_summary"]
         metrics = result["quality_metrics"]
 
-        VERDICT_LABEL = {
-            "APPROVED":     "✓  APPROVED — ready for HR / manager distribution",
-            "NEEDS_REVIEW": "⚠  NEEDS_REVIEW — human review required before distribution",
-            "REJECTED":     "✗  REJECTED — do NOT distribute this report",
+        LABEL = {
+            "APPROVED":     "APPROVED — ready for HR / manager distribution",
+            "NEEDS_REVIEW": "NEEDS_REVIEW — human review required before distribution",
+            "REJECTED":     "REJECTED — do NOT distribute this report",
         }
 
         print("\n" + "=" * 70)
-        print(f"  AUDIT REPORT  |  run_id: {run_id}")
+        print(f"  RISK AUDIT REPORT  |  run_id: {run_id}")
         print(f"  audit_id: {audit_id}")
         print("=" * 70)
-        print(f"\n  {VERDICT_LABEL.get(verdict, verdict)}\n")
+        print(f"\n  {LABEL.get(verdict, verdict)}\n")
         print(f"  Records reviewed : {summary['total_reviewed']}")
-        print(f"  Approved         : {summary['approved_count']}")
         print(f"  Flagged          : {summary['flagged_count']}")
         print(f"  Critical issues  : {summary['critical_count']}")
         print()
@@ -493,17 +415,11 @@ class AuditAgent:
         print(f"    Overall quality       : {metrics['overall_quality_score']:.1f}")
         print()
 
-        flagged = result.get("flagged_employees") or []
-        if flagged:
-            print(f"  Flagged employees ({len(flagged)}):")
-            for f in flagged:
-                sev = f["severity"]
-                print(f"    [{sev:8}] {f['employee_id']}")
-                for issue in f["issues"]:
-                    print(f"              • {issue}")
-                print(f"              → {f['suggested_correction']}")
-        else:
-            print("  No employees flagged.")
+        for f in result.get("flagged_employees") or []:
+            print(f"  [{f['severity']:8}] {f['employee_id']}")
+            for issue in f["issues"]:
+                print(f"             • {issue}")
+            print(f"             → {f['suggested_correction']}")
 
         print()
         print("  Audit notes:")
@@ -516,20 +432,16 @@ class AuditAgent:
 # ──────────────────────────────────────────────────────────────────────────────
 # Module-level entry point
 # ──────────────────────────────────────────────────────────────────────────────
-def run_audit_agent(run_id: str | None = None) -> dict:
-    """Instantiate AuditAgent and audit the specified (or latest) risk run."""
-    agent = AuditAgent()
+def run_risk_audit_agent(run_id: str | None = None) -> dict:
+    """Instantiate RiskAuditAgent and audit the specified (or latest) risk run."""
+    agent = RiskAuditAgent()
     return agent.run(run_id=run_id)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Audit Agent — HR report quality gate")
-    parser.add_argument(
-        "--run-id",
-        default=None,
-        help="run_id to audit (default: most recent run)",
-    )
+    parser = argparse.ArgumentParser(description="Risk Audit Agent — retention risk report quality gate")
+    parser.add_argument("--run-id", default=None, help="run_id to audit (default: most recent run)")
     args = parser.parse_args()
-    run_audit_agent(run_id=args.run_id)
+    run_risk_audit_agent(run_id=args.run_id)

@@ -43,15 +43,20 @@ Salary risk tier thresholds:
 """
 
 import os
+import sys
 import json
 import pickle
 import datetime
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from tools.mongoDB import MarketDB
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+from database_mysql import DatabaseManager
 
 warnings.filterwarnings("ignore")
 
@@ -70,7 +75,7 @@ def ensure_columns(df: pd.DataFrame, needed_cols: list, fill_value=0) -> pd.Data
     return df
 
 
-class SalaryRiskAgent:
+class RiskScorer:
     """
     Salary risk scorer combining Cox survival analysis with market pay gap analysis.
 
@@ -189,39 +194,44 @@ class SalaryRiskAgent:
         return eq_df[keep].copy()
 
     # ------------------------------------------------------------------
+    # MySQL loader
+    # ------------------------------------------------------------------
+
+    def _load_from_mysql(self) -> pd.DataFrame:
+        """
+        Load all employee records from MySQL employee_risk_profiles table.
+        Missing Cox features (YearsSinceLastPromotion, OverTime_flag,
+        WorkLifeBalance, JobSatisfaction, EnvironmentSatisfaction) are
+        filled with 0 by _prepare_data — same as the CSV path.
+        """
+        mysql_db = DatabaseManager()
+        rows = mysql_db.fetch_all("SELECT * FROM employee_risk_profiles")
+        if not rows:
+            raise RuntimeError("No rows returned from employee_risk_profiles")
+
+        col_rows = mysql_db.fetch_all("DESCRIBE employee_risk_profiles")
+        col_names = [r[0] for r in col_rows]
+
+        df = pd.DataFrame(rows, columns=col_names)
+        print(f"[RiskScorer] Loaded {len(df)} employees from MySQL")
+        return df
+
+    # ------------------------------------------------------------------
     # Feature engineering
     # ------------------------------------------------------------------
 
-    def _prepare_data(self, csv_path: str) -> pd.DataFrame:
+    def _prepare_data_core(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Load ibm_enhanced_test.csv and engineer Cox model features.
+        Engineer Cox model features from a raw DataFrame.
 
-        Column mapping (CSV → Cox feature schema):
-          current_salary / 12   → MonthlyIncome  (annual → monthly)
-          YearsAtCompany        → duration        (0 replaced by 0.5 to avoid t=0)
-          PercentSalaryHike     → direct use
-          JobInvolvement        → direct use
-          JobLevel              → direct use
-          TotalWorkingYears     → direct use
+        Column mapping:
+          current_salary / 12   → MonthlyIncome
+          YearsAtCompany        → duration  (0 replaced by 0.5)
 
-        Columns absent from ibm_enhanced_test.csv (filled with 0):
+        Missing Cox columns filled with 0:
           YearsSinceLastPromotion, OverTime_flag, WorkLifeBalance,
           JobSatisfaction, EnvironmentSatisfaction
-
-        Args:
-            csv_path: Path to ibm_enhanced_test.csv.
-
-        Returns:
-            pd.DataFrame: Enriched DataFrame ready for model input construction.
-
-        Raises:
-            FileNotFoundError: If csv_path does not exist.
         """
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV not found: {csv_path}")
-
-        df = pd.read_csv(csv_path)
-
         # Normalise employee_id
         if "employee_id" not in df.columns:
             if "EmployeeNumber" in df.columns:
@@ -278,6 +288,15 @@ class SalaryRiskAgent:
                 df[col_out] = np.nan
 
         return df
+
+    def _prepare_data_from_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Same feature engineering as _prepare_data but takes a DataFrame directly."""
+        return self._prepare_data_core(df)
+
+    def _prepare_data(self, csv_path: str) -> pd.DataFrame:
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"CSV not found: {csv_path}")
+        return self._prepare_data_core(pd.read_csv(csv_path))
 
     def _build_model_input(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -368,7 +387,7 @@ class SalaryRiskAgent:
         Args:
             docs: List of dicts produced by run() or enriched by the AI agent.
         """
-        risk_coll = self.db.db["Risk"]
+        risk_coll = self.db.db[os.getenv("COLLECTION_NAME_RISK", "Risk")]
         db_name   = self.db.db.name
         print(f"[MongoDB] Inserting {len(docs)} new records into {db_name}.Risk ...")
 
@@ -391,32 +410,37 @@ class SalaryRiskAgent:
         self.db.close()
         print(f"[MongoDB] Done — {inserted} new records inserted.")
 
-    def run(self, csv_path: str) -> list:
+    def run(self, csv_path: str | None = None) -> list:
         """
         Execute the salary risk scoring pipeline and return scored documents.
 
-        Does NOT write to MongoDB — call save_results(docs) afterwards
-        (either directly, or after enriching docs via the AI orchestrator).
+        Does NOT write to MongoDB — call save_results(docs) afterwards.
+
+        Data source priority:
+          1. MySQL employee_risk_profiles  (preferred — full 1000-employee dataset)
+          2. csv_path fallback             (used only if MySQL is unavailable)
 
         Steps:
-          1. Load ibm_enhanced_test.csv + engineer features.
+          1. Load employee data from MySQL (or CSV fallback).
           2. Merge equity pay gap signals from MongoDB.
-          3. Resolve market median per employee (CSV → MongoDB fallback).
+          3. Resolve market median per employee (table column → MongoDB fallback).
           4. Compute salary gap (abs + %) and salary risk tier.
           5. Run Cox model → partial hazard scores → percentile buckets.
           6. Derive combined risk bucket.
           7. Build human-readable risk factor list.
           8. Return list of scored dicts (one per employee).
 
-        Args:
-            csv_path: Path to ibm_enhanced_test.csv.
-
         Returns:
-            list[dict]: JSON-serialisable scored documents ready for
-                        optional enrichment and MongoDB upsert.
+            list[dict]: JSON-serialisable scored documents ready for MongoDB upsert.
         """
-        print(f"Loading employee data from: {csv_path}")
-        df = self._prepare_data(csv_path)
+        try:
+            df = self._load_from_mysql()
+            df = self._prepare_data_from_df(df)
+        except Exception as e:
+            print(f"[RiskScorer] MySQL load failed ({e}), falling back to CSV: {csv_path}")
+            if not csv_path:
+                raise
+            df = self._prepare_data(csv_path)
 
         # ── MongoDB data ────────────────────────────────────────────────
         benchmarks = self._load_salary_benchmarks()
@@ -542,7 +566,7 @@ class SalaryRiskAgent:
 # Module-level entry point used by main.py
 # ---------------------------------------------------------------------------
 
-def run_salary_risk_agent():
+def run_risk_scorer():
     """
     Standalone entry point: score → save (no AI enrichment).
 
@@ -557,7 +581,7 @@ def run_salary_risk_agent():
     print(f"Features: {feature_json_path}")
     print(f"CSV     : {csv_path}")
 
-    agent = SalaryRiskAgent(model_path, feature_json_path)
+    agent = RiskScorer(model_path, feature_json_path)
     docs = agent.run(csv_path)
     agent.save_results(docs)
     print(f"Salary Risk Agent complete → MongoDB: Risk ({len(docs)} records)")

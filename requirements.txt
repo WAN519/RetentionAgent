@@ -24,6 +24,9 @@ requests
 python-dotenv
 google-generativeai
 bcrypt
+fastapi
+uvicorn[standard]
+gunicorn
 
 # Claude API
 anthropic
