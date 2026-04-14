@@ -74,6 +74,72 @@ graph TD
 
 ---
 
+## Models
+
+### Self-Trained Models
+
+#### 1. LightGBM Salary Regression — `models/agent_salary_regressor.pkl`
+
+| Item | Detail |
+|------|--------|
+| Algorithm | LightGBM gradient boosted trees |
+| Task | Regression — predict an employee's fair monthly income (log1p-transformed target) |
+| Training data | IBM HR Analytics dataset (`data/Attrition.csv`) |
+| Input features | 25 features: role, tenure, performance, department, business travel, stock options, education field, and more (see `agents/equity/equity_agent.py` for the full ordered feature list) |
+| Key engineered features | `Market_Median_2026` (BLS CPI-adjusted benchmark), `Internal_Salary_Rank`, `Performance_Consistency` |
+| Output | Predicted fair annual salary — compared against actual salary to compute internal equity gap (`internal_gap_pct`) and external market gap (`external_gap_pct`) |
+| Used by | Equity Agent (`agents/equity/equity_agent.py`) |
+
+#### 2. Cox Proportional Hazard Survival Model — `models/cox_retention_v1.pkl`
+
+| Item | Detail |
+|------|--------|
+| Algorithm | Cox Proportional Hazard model (lifelines library) |
+| Task | Survival analysis — model the time-to-attrition hazard for each employee |
+| Training data | IBM HR Analytics dataset — duration: `YearsAtCompany`, event: `Attrition == 'Yes'` |
+| Input features | `MonthlyIncome`, `YearsSinceLastPromotion`, `OverTime_flag`, `WorkLifeBalance`, `JobSatisfaction`, `EnvironmentSatisfaction`, `JobLevel`, `StockOptionLevel`, and others (full list in `models/cox_retention_v1_features.json`) |
+| Output | Partial hazard score per employee → percentile-ranked into Low / Mid / High risk buckets (top 10% = High, 50–90% = Mid, bottom 50% = Low) |
+| Risk combination | Cox bucket + salary gap tier are combined by taking the higher of the two signals |
+| Used by | Retention Agent (`agents/retention/risk_scorer.py`) |
+
+---
+
+### Pre-Trained Models (HuggingFace)
+
+#### 3. `sentence-transformers/all-MiniLM-L6-v2`
+
+| Item | Detail |
+|------|--------|
+| Type | Sentence embedding model (Sentence-Transformers) |
+| Task | Encode Glassdoor review text and topic definitions into vector space; assign topic labels via cosine similarity |
+| Topics detected | `sem_management`, `sem_salary`, `sem_workload`, `sem_career` |
+| Threshold | Cosine similarity > 0.35 → binary label assigned to that topic |
+| Hardware | Runs on Apple MPS (Apple Silicon) when available, falls back to CPU |
+| Used by | Emotion Agent (`tools/emotion_tool.py`) |
+
+#### 4. `cardiffnlp/twitter-roberta-base-sentiment-latest`
+
+| Item | Detail |
+|------|--------|
+| Type | RoBERTa fine-tuned on Twitter data (HuggingFace `transformers` pipeline) |
+| Task | Sentiment polarity classification — outputs Positive / Neutral / Negative label + confidence score per review |
+| Input truncation | Review "cons" text is truncated to 1000 characters to stay within RoBERTa's 512-token limit |
+| Output stored | `roberta_label`, `roberta_score` per review → persisted to MongoDB `reviews_analysis` collection |
+| Used by | Emotion Agent (`tools/emotion_tool.py`) |
+
+---
+
+### LLM — Claude claude-opus-4-6 (Anthropic)
+
+| Agent | Role |
+|-------|------|
+| Retention Agent | Analyzes Cox + salary gap scores for High/Mid risk employees in batches of 50; outputs structured HR insights (risk summary, root causes, urgency, recommendations) |
+| Recommendation Agent | Tool-use agentic loop — calls `get_employee_profiles` then `save_recommendations`; generates weighted per-employee retention plans with routing (HR vs. Management) |
+| Recommendation Audit Agent | Adversarial critic — reviews recommendation quality against 5 rule categories (weight validity, score consistency, specificity, routing, priority calibration); returns APPROVED / NEEDS_REVIEW / REJECTED verdict |
+| Emotion Agent | Synthesizes Glassdoor NLP results into a structured company-level sentiment report after calling three tools in sequence |
+
+---
+
 ## Key Features
 
 - **Three-agent ML pipeline** — Equity Agent (LightGBM), Retention Agent (Cox survival model), and Emotion Agent (NLP) run sequentially and write enriched results to MongoDB
