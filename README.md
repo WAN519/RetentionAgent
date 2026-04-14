@@ -257,15 +257,18 @@ npm run dev
 | Recommendation Pipeline | Claude tool-use recommendation generator + adversarial audit loop (`agents/recommendation/`, `agents/recommendation_audit/`, `agents/pipeline/`) |
 | MongoDB Schema Design | Collection design for Equity_Predictions, Risk, retention_recommendations |
 
-### Member 2 — Frontend, API & Data Infrastructure
+### Member 2 — API & Data Infrastructure
 
 | Area | Details |
 |------|---------|
-| React Frontend | Full single-page app — Home, Login, Portal, HR Dashboard, Manager View (`retention-ui/src/App.jsx`) |
 | FastAPI Backend | `/api/login` and `/api/employees` endpoints, role-based data filtering, MongoDB query logic (`api/server.py`) |
 | Mock Data Scripts | Employee dataset generation and MySQL seeding (`scripts/MockData.py`, `scripts/database_mysql.py`) |
 | Deployment | GitHub Pages (frontend), Render (FastAPI backend), CORS and environment configuration |
 | Data Pipeline Support | CSV preprocessing, MongoDB upload scripts, dataset management (`scripts/`) |
+
+### AI-Generated — Frontend
+
+The React frontend (`retention-ui/src/App.jsx`) was fully generated with the assistance of Claude (Anthropic). This includes the complete single-page application architecture — Home, Login, Portal, HR Dashboard, and Manager View — along with all UI components, role-based routing logic, API integration, and visual design. AI-assisted development was used to accelerate prototyping and iterate rapidly on the dashboard layout and interaction design.
 
 ---
 
